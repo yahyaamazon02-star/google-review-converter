@@ -8,76 +8,85 @@ export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   let { url } = req.body || {};
-  if (!url || (!url.includes('maps.app.goo.gl') && !url.includes('google.com/maps') && !url.includes('goo.gl/maps') && !url.includes('maps.google.com'))) {
+  if (!url) {
     return res.status(400).json({ error: 'Please enter a valid Google Maps URL.' });
   }
 
   try {
-    const headers = {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Cookie': 'CONSENT=YES+; SOCS=CAESEwgDEgk2MDQ1NjkyODQaAmVuIAEaBgiA_LyaBg;',
-    };
+    let collectedData = url;
 
-    // 1. Initial request to resolve the shortlink
-    let response = await fetch(url, {
-      headers,
-      redirect: 'follow',
+    // 1. Intercept manual 302 redirect header directly from short link
+    const resManual = await fetch(url, {
+      method: 'GET',
+      redirect: 'manual',
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      },
     });
 
-    let finalUrl = response.url || url;
-    let html = await response.text();
+    const locationHeader = resManual.headers.get('location');
+    if (locationHeader) {
+      collectedData += ' ' + locationHeader;
 
-    // 2. If redirected to consent page, extract and fetch the actual target URL
-    if (finalUrl.includes('consent.google.com') && finalUrl.includes('continue=')) {
+      // 2. Fetch destination with cookies to capture full place payload
       try {
-        const parsedUrl = new URL(finalUrl);
-        const continueUrl = decodeURIComponent(parsedUrl.searchParams.get('continue') || '');
-        if (continueUrl) {
-          finalUrl = continueUrl;
-          const retryRes = await fetch(continueUrl, { headers, redirect: 'follow' });
-          html = await retryRes.text();
-        }
+        const resFollow = await fetch(locationHeader, {
+          method: 'GET',
+          redirect: 'follow',
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Cookie': 'CONSENT=YES+; SOCS=CAESEwgDEgk2MDQ1NjkyODQaAmVuIAEaBgiA_LyaBg;',
+          },
+        });
+        const html = await resFollow.text();
+        collectedData += ' ' + (resFollow.url || '') + ' ' + html;
       } catch (e) {}
+    } else {
+      const initialHtml = await resManual.text();
+      collectedData += ' ' + initialHtml;
     }
 
-    const combinedData = decodeURIComponent(finalUrl) + ' ' + html;
+    const decoded = decodeURIComponent(collectedData);
 
-    // 3. Look for standard Google Place ID (ChIJ...)
-    const placeIdMatch = combinedData.match(/ChIJ[a-zA-Z0-9_-]{23,}/);
-    let placeId = placeIdMatch ? placeIdMatch[0] : null;
+    // Look for Place ID (ChIJ...)
+    const placeIdMatch = decoded.match(/ChIJ[a-zA-Z0-9_-]{23,}/);
+    if (placeIdMatch) {
+      const placeId = placeIdMatch[0];
+      return res.status(200).json({
+        success: true,
+        placeId,
+        reviewUrl: `https://search.google.com/local/writereview?placeid=${placeId}`,
+      });
+    }
 
-    // 4. Look for CID / Feature ID (0x...:0x[hex]) as fallback
-    let cid = null;
-    const hexMatch = combinedData.match(/0x[0-9a-fA-F]+:0x([0-9a-fA-F]+)/);
+    // Look for Hex CID / Feature ID (0x...:0x[hex]) as fallback
+    const hexMatch = decoded.match(/0x[0-9a-fA-F]+:0x([0-9a-fA-F]+)/);
     if (hexMatch) {
       try {
-        cid = BigInt('0x' + hexMatch).toString();
+        const cid = BigInt('0x' + hexMatch).toString();
+        return res.status(200).json({
+          success: true,
+          placeId: cid,
+          reviewUrl: `https://maps.google.com/?cid=${cid}`,
+        });
       } catch (e) {}
     }
 
-    const directCidMatch = combinedData.match(/(?:cid|ludocid)[=\/:\\]+([0-9]{10,})/i);
-    if (directCidMatch) {
-      cid = directCidMatch;
+    // Look for decimal CID in URL parameters
+    const cidMatch = decoded.match(/(?:cid|ludocid)[=\/:\\]+([0-9]{10,})/i);
+    if (cidMatch) {
+      const cid = cidMatch;
+      return res.status(200).json({
+        success: true,
+        placeId: cid,
+        reviewUrl: `https://maps.google.com/?cid=${cid}`,
+      });
     }
 
-    let reviewUrl = '';
-    if (placeId) {
-      reviewUrl = `https://search.google.com/local/writereview?placeid=${placeId}`;
-    } else if (cid) {
-      reviewUrl = `https://maps.google.com/?cid=${cid}`;
-    } else {
-      return res.status(404).json({ error: 'Could not extract Place ID or CID from the link.' });
-    }
-
-    return res.status(200).json({
-      success: true,
-      placeId: placeId || cid,
-      reviewUrl,
-    });
+    return res.status(404).json({ error: 'Could not extract Place ID or CID from the link.' });
   } catch (error) {
-    return res.status(500).json({ error: 'Failed to resolve the Maps link.', details: error.message });
+    return res.status(500).json({ error: 'Failed to resolve the Maps link.' });
   }
 }
